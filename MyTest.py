@@ -17,8 +17,8 @@ ALIGN_CORNERS = True  # 与训练/模型文件保持一致，减少插值差异
 def save_gray_png(path: str, arr01: np.ndarray) -> None:
     """保存单通道预测为 8-bit PNG。
 
-    解释：imageio/PIL 不能直接把 float32(F mode) 写成 PNG，会报
-    "cannot write mode F as PNG"；因此统一转 uint8。
+    imageio/PIL 无法直接保存 float32 的 PNG（会报 cannot write mode F as PNG），
+    所以这里统一转 uint8。
     """
     arr01 = np.clip(arr01, 0.0, 1.0)
     arr_u8 = (arr01 * 255.0).astype(np.uint8)
@@ -28,8 +28,14 @@ def save_gray_png(path: str, arr01: np.ndarray) -> None:
 def load_checkpoint(model: torch.nn.Module, ckpt_path: str) -> None:
     """兼容 CPU/GPU、DataParallel('module.') 前缀的加载方式。"""
     state = torch.load(ckpt_path, map_location='cpu')
-    if isinstance(state, dict) and 'state_dict' in state:
-        state = state['state_dict']
+    # 兼容两类保存：
+    # 1) torch.save(model.state_dict())
+    # 2) torch.save({'model': model.state_dict(), ...})  (MyTrain.py 的 checkpoint)
+    if isinstance(state, dict):
+        if 'state_dict' in state:
+            state = state['state_dict']
+        elif 'model' in state:
+            state = state['model']
 
     new_state = {}
     for k, v in state.items():
@@ -44,22 +50,21 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--testsize', type=int, default=352, help='testing size')
-    parser.add_argument('--pth_path', type=str, default='./snapshots/PraNet_Res2Net_RAWeight/PraNet-19.pth')
-
-    # 第六点(3)：为了做跨数据集泛化对比，建议把输出目录区分开，避免覆盖
-    parser.add_argument('--exp_name', type=str, default='PraNet_RAWeight',
-                        help='subfolder name under ./results/ to avoid overwriting')
-
+    parser.add_argument(
+        '--pth_path',
+        type=str,
+        default='./snapshots/PraNet_Res2Net_RAWeight/checkpoints/best.pth',
+        help='checkpoint path. If you train with MyTrain.py, best model is usually in snapshots/<train_save>/checkpoints/best.pth'
+    )
+    parser.add_argument('--dynamic_gate', action='store_true', help='enable sample-adaptive RA gating (must match training)')
     args = parser.parse_args()
 
-    datasets = ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB']
-
-    for _data_name in datasets:
+    for _data_name in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB']:
         data_path = './data/TestDataset/{}/'.format(_data_name)
-        save_path = './results/{}/{}/'.format(args.exp_name, _data_name)
+        save_path = './results/PraNet_RAWeight/{}/'.format(_data_name)
         os.makedirs(save_path, exist_ok=True)
 
-        model = PraNet().cuda().eval()
+        model = PraNet(use_dynamic_gate=args.dynamic_gate).cuda().eval()
         load_checkpoint(model, args.pth_path)
 
         image_root = '{}/images/'.format(data_path)
