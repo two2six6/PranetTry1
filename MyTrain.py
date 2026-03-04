@@ -1,5 +1,4 @@
 import os
-import csv
 import argparse
 from datetime import datetime
 
@@ -7,36 +6,15 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-# 使用带“可学习 RA 权重”的模型版本（包含 ra_w*/ra_beta*）
+# 你的模型文件（保持 import 路径不变）
 from lib.PraNet_Res2Net_RAWeight import PraNet
 from utils.dataloader import get_loader
 from utils.utils import clip_gradient, adjust_lr, AvgMeter
 
 
-ALIGN_CORNERS = True  # 与模型/测试保持一致，减少插值差异
-
-
-def log_ra_to_csv(model: torch.nn.Module, csv_path: str, epoch: int, step: int, tag: str = "epoch_end") -> None:
-    """把 ra_w*/ra_beta* 的“有效值”(sigmoid 后)记录到 CSV。
-
-    - 目的：证明可学习参数确实在训练中发生变化；
-    - 用途：后续可以直接用这个 CSV 画曲线，写消融/可解释性。
-    """
-    if not hasattr(model, "get_ra_strength"):
-        return
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    row = {"epoch": epoch, "step": step, "tag": tag, **model.get_ra_strength()}
-    write_header = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=row.keys())
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
-
-
 def structure_loss(pred, mask):
+    """PraNet 原论文常用的结构损失：加权 BCE + 加权 IoU。"""
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
-    # PyTorch 1.10: 使用 reduction= 而不是 reduce=
     wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction='none')
     wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
 
@@ -47,133 +25,261 @@ def structure_loss(pred, mask):
     return (wbce + wiou).mean()
 
 
-def set_ra_mode(model: torch.nn.Module, ra_mode: str) -> None:
-    """严格消融开关。
+@torch.no_grad()
+def evaluate(loader, model, trainsize):
+    """用同一个 loss 在验证集上评估，用于 early stopping。"""
+    model.eval()
+    loss_meter = AvgMeter()
+    for images, gts in loader:
+        images = images.cuda(non_blocking=True)
+        gts = gts.cuda(non_blocking=True)
+        # 保持和训练一致的输入分辨率
+        if images.shape[-1] != trainsize:
+            images = F.interpolate(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
+            gts = F.interpolate(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
 
-    - learnable: ra_w*/ra_beta* 参与训练（你的“可学习权重”实验）
-    - fixed: 固定 ra_w*/ra_beta*，等价于“原版强度”
+        l5, l4, l3, l2 = model(images)
+        loss = (structure_loss(l5, gts) + structure_loss(l4, gts) +
+                structure_loss(l3, gts) + structure_loss(l2, gts))
+        loss_meter.update(loss.item(), images.size(0))
+    return loss_meter.show()
 
-    注意：模型里实际用的是 sigmoid(raw_param) 作为有效值。
-    要让有效值接近 1，我们把 raw_param 设成一个较大的正数（如 10.0），使 sigmoid(10)≈1。
+
+def build_optimizer(model, base_lr, gate_lr_mult=10.0, weight_decay=0.0):
+    """把 gating 参数单独分组，提高学习率（默认 ×10）。
+
+    规则：名字里包含 'gate' 或 'ra_logit' 的参数认为是 gating 相关。
     """
-    if ra_mode not in {"learnable", "fixed"}:
-        raise ValueError(f"Unknown ra_mode: {ra_mode}")
+    gate_params, other_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if ('gate' in name) or ('ra_logit' in name):
+            gate_params.append(p)
+        else:
+            other_params.append(p)
 
-    target_names = {"ra_w4", "ra_w3", "ra_w2", "ra_beta4", "ra_beta3", "ra_beta2"}
-
-    if ra_mode == "fixed":
-        with torch.no_grad():
-            for n, p in model.named_parameters():
-                if n in target_names:
-                    p.fill_(10.0)
-
-        for n, p in model.named_parameters():
-            if n in target_names:
-                p.requires_grad = False
-    else:
-        for n, p in model.named_parameters():
-            if n in target_names:
-                p.requires_grad = True
+    param_groups = [
+        {'params': other_params, 'lr': base_lr, 'weight_decay': weight_decay},
+        {'params': gate_params, 'lr': base_lr * gate_lr_mult, 'weight_decay': weight_decay},
+    ]
+    optimizer = torch.optim.Adam(param_groups)
+    return optimizer
 
 
-def train(train_loader, model, optimizer, epoch, log_every: int = 0):
+def save_checkpoint(path, model, optimizer, epoch, best_loss, bad_epochs, opt):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    ckpt = {
+        'epoch': epoch,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'best_loss': best_loss,
+        'bad_epochs': bad_epochs,
+        'opt': vars(opt),
+        'time': str(datetime.now())
+    }
+    torch.save(ckpt, path)
+
+
+def load_checkpoint(path, model, optimizer=None):
+    ckpt = torch.load(path, map_location='cpu')
+    model.load_state_dict(ckpt['model'], strict=True)
+    if optimizer is not None and 'optimizer' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer'])
+    epoch = int(ckpt.get('epoch', 0))
+    best_loss = float(ckpt.get('best_loss', float('inf')))
+    bad_epochs = int(ckpt.get('bad_epochs', 0))
+    return epoch, best_loss, bad_epochs
+
+
+def train_one_epoch(train_loader, model, optimizer, opt, epoch):
     model.train()
-    size_rates = [0.75, 1, 1.25]
+    size_rates = [0.75, 1, 1.25] if opt.ms_train else [1]
+
     loss_record2, loss_record3, loss_record4, loss_record5 = AvgMeter(), AvgMeter(), AvgMeter(), AvgMeter()
 
     for i, pack in enumerate(train_loader, start=1):
         for rate in size_rates:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             images, gts = pack
-            images = Variable(images).cuda()
-            gts = Variable(gts).cuda()
+            images = Variable(images).cuda(non_blocking=True)
+            gts = Variable(gts).cuda(non_blocking=True)
 
             trainsize = int(round(opt.trainsize * rate / 32) * 32)
             if rate != 1:
-                images = F.interpolate(images, size=(trainsize, trainsize), mode='bilinear', align_corners=ALIGN_CORNERS)
-                gts = F.interpolate(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=ALIGN_CORNERS)
+                images = F.interpolate(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
+                gts = F.interpolate(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
 
-            lateral_map_5, lateral_map_4, lateral_map_3, lateral_map_2 = model(images)
+            l5, l4, l3, l2 = model(images)
 
-            loss5 = structure_loss(lateral_map_5, gts)
-            loss4 = structure_loss(lateral_map_4, gts)
-            loss3 = structure_loss(lateral_map_3, gts)
-            loss2 = structure_loss(lateral_map_2, gts)
+            loss5 = structure_loss(l5, gts)
+            loss4 = structure_loss(l4, gts)
+            loss3 = structure_loss(l3, gts)
+            loss2 = structure_loss(l2, gts)
             loss = loss2 + loss3 + loss4 + loss5
+
+            # 可选：让 gating 参数“先学会原版”，再逐渐偏离（稳定性更好）
+            # reg = λ * Σ_k [(1-w_k)^2 + (1-β_k)^2]
+            if opt.gate_reg > 0:
+                gates = model.get_gate_values()  # dict of tensors
+                reg = 0.0
+                for k in ('w4', 'w3', 'w2', 'b4', 'b3', 'b2'):
+                    if k in gates:
+                        reg = reg + (1.0 - gates[k]).pow(2).mean()
+                loss = loss + opt.gate_reg * reg
 
             loss.backward()
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
 
             if rate == 1:
-                loss_record2.update(loss2.data, opt.batchsize)
-                loss_record3.update(loss3.data, opt.batchsize)
-                loss_record4.update(loss4.data, opt.batchsize)
-                loss_record5.update(loss5.data, opt.batchsize)
+                bs = images.size(0)
+                loss_record2.update(loss2.item(), bs)
+                loss_record3.update(loss3.item(), bs)
+                loss_record4.update(loss4.item(), bs)
+                loss_record5.update(loss5.item(), bs)
 
-        if i % 20 == 0 or i == total_step:
-            msg = ('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], '
-                   '[lateral-2: {:.4f}, lateral-3: {:.4f}, lateral-4: {:.4f}, lateral-5: {:.4f}]').format(
-                datetime.now(), epoch, opt.epoch, i, total_step,
-                loss_record2.show(), loss_record3.show(), loss_record4.show(), loss_record5.show()
+        if i % opt.print_freq == 0 or i == len(train_loader):
+            print(
+                '{} Epoch [{:03d}/{:03d}] Step [{:04d}/{:04d}] '
+                '[l2:{:.4f} l3:{:.4f} l4:{:.4f} l5:{:.4f}]'.format(
+                    datetime.now(), epoch, opt.epochs, i, len(train_loader),
+                    loss_record2.show(), loss_record3.show(), loss_record4.show(), loss_record5.show()
+                )
             )
-            print(msg)
 
-        # 可选：训练中途也记录 ra 强度（默认关闭，避免 I/O 太频繁）
-        if log_every and (i % log_every == 0):
-            csv_path = os.path.join('snapshots', opt.train_save, 'ra_strength.csv')
-            log_ra_to_csv(model, csv_path, epoch=epoch, step=(epoch - 1) * total_step + i, tag='step')
+    # 用训练集的“主尺度”loss 作为 train-loss（用于没 val 时的 early stop）
+    train_loss = loss_record2.show() + loss_record3.show() + loss_record4.show() + loss_record5.show()
+    return float(train_loss)
 
-    # epoch 结束：记录一次 ra 强度 + 打印
-    csv_path = os.path.join('snapshots', opt.train_save, 'ra_strength.csv')
-    log_ra_to_csv(model, csv_path, epoch=epoch, step=epoch * total_step, tag='epoch_end')
-    if hasattr(model, 'get_ra_strength'):
-        print('[RA Strength]', model.get_ra_strength())
 
-    save_path = 'snapshots/{}/'.format(opt.train_save)
-    os.makedirs(save_path, exist_ok=True)
-    if (epoch + 1) % 10 == 0:
-        torch.save(model.state_dict(), os.path.join(save_path, 'PraNet-%d.pth' % epoch))
-        print('[Saving Snapshot:]', os.path.join(save_path, 'PraNet-%d.pth' % epoch))
+def main(opt):
+    torch.backends.cudnn.benchmark = True
+
+    # ---- build model ----
+    model = PraNet(channel=opt.channel, use_dynamic_gate=opt.dynamic_gate, gate_hidden=opt.gate_hidden).cuda()
+
+    optimizer = build_optimizer(
+        model,
+        base_lr=opt.lr,
+        gate_lr_mult=opt.gate_lr_mult,
+        weight_decay=opt.weight_decay,
+    )
+
+    # ---- data ----
+    train_image_root = os.path.join(opt.train_path, 'images')
+    train_gt_root = os.path.join(opt.train_path, 'masks')
+    train_loader = get_loader(train_image_root + '/', train_gt_root + '/', batchsize=opt.batchsize, trainsize=opt.trainsize)
+
+    val_loader = None
+    if opt.val_path:
+        val_image_root = os.path.join(opt.val_path, 'images')
+        val_gt_root = os.path.join(opt.val_path, 'masks')
+        # 验证集一般 batch=1 更稳妥
+        val_loader = get_loader(val_image_root + '/', val_gt_root + '/', batchsize=1, trainsize=opt.trainsize)
+
+    # ---- resume ----
+    start_epoch = 1
+    best_loss = float('inf')
+    bad_epochs = 0
+
+    ckpt_dir = os.path.join('snapshots', opt.train_save, 'checkpoints')
+    last_ckpt = os.path.join(ckpt_dir, 'last.pth')
+    best_ckpt = os.path.join(ckpt_dir, 'best.pth')
+
+    if opt.resume:
+        print(f"[Resume] Loading checkpoint: {opt.resume}")
+        last_epoch, best_loss, bad_epochs = load_checkpoint(opt.resume, model, optimizer)
+        start_epoch = last_epoch + 1
+        print(f"[Resume] start_epoch={start_epoch}, best_loss={best_loss:.6f}, bad_epochs={bad_epochs}")
+
+    print('#' * 20, 'Start Training', '#' * 20)
+
+    for epoch in range(start_epoch, opt.epochs + 1):
+        # 仍保留你原本的 adjust_lr（如果你想换 scheduler，也行）
+        adjust_lr(optimizer, opt.lr, epoch, opt.decay_rate, opt.decay_epoch)
+
+        train_loss = train_one_epoch(train_loader, model, optimizer, opt, epoch)
+
+        # early stopping 监控：优先 val_loss
+        if val_loader is not None:
+            val_loss = evaluate(val_loader, model, opt.trainsize)
+            monitor = val_loss
+            print(f"[Eval] Epoch {epoch}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+        else:
+            monitor = train_loss
+            print(f"[Eval] Epoch {epoch}: train_loss={train_loss:.6f} (no val)")
+
+        # 保存 last
+        save_checkpoint(last_ckpt, model, optimizer, epoch, best_loss, bad_epochs, opt)
+
+        # 保存 best + 更新 early stop
+        improved = monitor < (best_loss - opt.min_delta)
+        if improved:
+            best_loss = monitor
+            bad_epochs = 0
+            save_checkpoint(best_ckpt, model, optimizer, epoch, best_loss, bad_epochs, opt)
+            print(f"[Checkpoint] New best: {best_loss:.6f} -> {best_ckpt}")
+        else:
+            bad_epochs += 1
+            print(f"[EarlyStop] No improvement. bad_epochs={bad_epochs}/{opt.patience}")
+
+        # 可选：每 N epoch 也保存一份 snapshot（兼容你原来的行为）
+        if opt.save_every > 0 and (epoch % opt.save_every == 0):
+            snap_path = os.path.join('snapshots', opt.train_save, f'PraNet-epoch{epoch}.pth')
+            os.makedirs(os.path.dirname(snap_path), exist_ok=True)
+            torch.save(model.state_dict(), snap_path)
+            print('[Saving Snapshot:]', snap_path)
+
+        if bad_epochs >= opt.patience:
+            print(f"[EarlyStop] Stop at epoch {epoch}. Best loss = {best_loss:.6f}")
+            break
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epoch', type=int, default=20, help='epoch number')
-    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
-    parser.add_argument('--batchsize', type=int, default=16, help='training batch size')
-    parser.add_argument('--trainsize', type=int, default=352, help='training dataset size')
-    parser.add_argument('--clip', type=float, default=0.5, help='gradient clipping margin')
-    parser.add_argument('--decay_rate', type=float, default=0.1, help='decay rate of learning rate')
-    parser.add_argument('--decay_epoch', type=int, default=50, help='every n epochs decay learning rate')
+
+    # 训练周期
+    parser.add_argument('--epochs', type=int, default=200, help='max epoch number (not limited to 20)')
+    parser.add_argument('--patience', type=int, default=20, help='early stopping patience (epochs)')
+    parser.add_argument('--min_delta', type=float, default=1e-4, help='min improvement to reset patience')
+
+    # 优化器/学习率
+    parser.add_argument('--lr', type=float, default=1e-4, help='base learning rate')
+    parser.add_argument('--gate_lr_mult', type=float, default=10.0, help='lr multiplier for gating params')
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+
+    # 数据
     parser.add_argument('--train_path', type=str, default='./data/TrainDataset', help='path to train dataset')
-    parser.add_argument('--train_save', type=str, default='PraNet_Res2Net_RAWeight', help='snapshot folder name')
+    parser.add_argument('--val_path', type=str, default='', help='(optional) path to val dataset, same format as train')
+    parser.add_argument('--batchsize', type=int, default=16, help='training batch size')
+    parser.add_argument('--trainsize', type=int, default=352, help='training image size')
 
-    # 第六点(2)：严格消融开关
-    parser.add_argument('--ra_mode', type=str, default='learnable', choices=['learnable', 'fixed'],
-                        help='learnable: ra_w*/ra_beta* 可学习；fixed: 固定为原版强度')
+    # 模型
+    parser.add_argument('--channel', type=int, default=32)
+    parser.add_argument('--dynamic_gate', action='store_true', help='enable sample-adaptive RA gating')
+    parser.add_argument('--gate_hidden', type=int, default=128, help='hidden dim for gating MLP')
 
-    # 第六点(1)：可选 step 级记录频率（0 表示只记录每个 epoch 结束）
-    parser.add_argument('--ra_log_every', type=int, default=0,
-                        help='log ra strength every N steps (0 = only at epoch end)')
+    # 稳定训练
+    parser.add_argument('--clip', type=float, default=0.5, help='gradient clipping margin')
+    parser.add_argument('--gate_reg', type=float, default=0.0, help='regularize gates toward 1 (e.g., 1e-3)')
+    parser.add_argument('--ms_train', action='store_true', help='multi-scale training (0.75/1/1.25)')
+
+    # 学习率衰减（保留你原来的策略）
+    parser.add_argument('--decay_rate', type=float, default=0.1)
+    parser.add_argument('--decay_epoch', type=int, default=50)
+
+    # 保存/续训
+    parser.add_argument('--train_save', type=str, default='PraNet_Res2Net_RAWeight')
+    parser.add_argument('--resume', type=str, default='', help='path to checkpoint .pth to resume')
+    parser.add_argument('--save_every', type=int, default=10, help='also save state_dict every N epochs (0 to disable)')
+
+    # log
+    parser.add_argument('--print_freq', type=int, default=20)
 
     opt = parser.parse_args()
+    if opt.val_path == '':
+        opt.val_path = ''
 
-    model = PraNet().cuda()
-    set_ra_mode(model, opt.ra_mode)
-
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), opt.lr)
-
-    image_root = '{}/images/'.format(opt.train_path)
-    gt_root = '{}/masks/'.format(opt.train_path)
-
-    train_loader = get_loader(image_root, gt_root, batchsize=opt.batchsize, trainsize=opt.trainsize)
-    total_step = len(train_loader)
-
-    print('#' * 20, 'Start Training', '#' * 20)
-    print('[RA Mode]', opt.ra_mode)
-
-    for epoch in range(1, opt.epoch + 1):
-        adjust_lr(optimizer, opt.lr, epoch, opt.decay_rate, opt.decay_epoch)
-        train(train_loader, model, optimizer, epoch, log_every=opt.ra_log_every)
+    main(opt)
